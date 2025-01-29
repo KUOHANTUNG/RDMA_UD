@@ -53,6 +53,8 @@ struct config_t
 	const char *dev_name; /* IB device name */
 	char *server_name;	/* server host name */
 	u_int32_t tcp_port;   /* server TCP port */
+	unsigned int size;
+
 	int ib_port;		  /* local IB port to work with */
 	int gid_idx;		  /* gid index to use */
 };
@@ -63,6 +65,7 @@ struct cm_con_data_t
 	uint32_t rkey;   /* Remote key */
 	uint32_t qp_num; /* QP number */
 	uint16_t lid;	/* LID of the IB port */
+	uint32_t psn;
 	uint8_t gid[16]; /* gid */
 } __attribute__((packed));
 
@@ -79,6 +82,7 @@ struct resources
 	struct ibv_cq *cq;				   /* CQ handle */
 	struct ibv_qp *qp;				   /* QP handle */
 	struct ibv_mr *mr;				   /* MR handle for buf */
+	struct ibv_ah *ah;					/*Ah handle */
 	char *buf;						   /* memory buffer pointer, used for RDMA and send
 ops */
 	int sock;						   /* TCP socket file descriptor */
@@ -88,7 +92,7 @@ struct config_t config = {
 	NULL,  /* server_name */
 	19875, /* tcp_port */
 	1,	 /* ib_port */
-	-1 /* gid_idx */};
+	1/* gid_idx */};
 
 /******************************************************************************
 Socket operations
@@ -317,19 +321,6 @@ static int post_send(struct resources *res, int opcode)
 	struct ibv_sge sge;
 	struct ibv_send_wr *bad_wr = NULL;
 	int rc;
-    struct ibv_ah_attr ah_attr = {
-		.is_global = 0,
-		.dlid = 0x0,
-		.sl = 1,
-		.src_path_bits = 0,
-		.port_num = 0
-	};
-
-    struct ibv_ah *ah = ibv_create_ah(res->pd, &ah_attr);
-	if(!ah){
-		fprintf(stderr, "Failed to create AH\n");
-		return 1;
-	}
 	/* prepare the scatter/gather entry */
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)res->buf;
@@ -343,7 +334,7 @@ static int post_send(struct resources *res, int opcode)
 	sr.num_sge = 1;
 	sr.opcode = opcode;
 	sr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
-    sr.wr.ud.ah = ah;
+    sr.wr.ud.ah = res->ah;
     sr.wr.ud.remote_qkey = 0;
     sr.wr.ud.remote_qpn = res->remote_props.qp_num;
 	if (opcode != IBV_WR_SEND)
@@ -595,7 +586,6 @@ static int resources_create(struct resources *res)
 	/* create the Queue Pair */
 	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
 	qp_init_attr.qp_type = IBV_QPT_UD;
-	qp_init_attr.sq_sig_all = 1;
 	qp_init_attr.send_cq = res->cq;
 	qp_init_attr.recv_cq = res->cq;
 	qp_init_attr.cap.max_send_wr = 128;
@@ -755,7 +745,7 @@ static int modify_qp_to_rtr(struct ibv_qp *qp)
 * Description
 * Transition a QP from the RTR to RTS state
 ******************************************************************************/
-static int modify_qp_to_rts(struct ibv_qp *qp)
+static int modify_qp_to_rts(struct ibv_qp *qp, int psn)
 {
 	struct ibv_qp_attr attr;
 	int flags;
@@ -765,7 +755,7 @@ static int modify_qp_to_rts(struct ibv_qp *qp)
 	// attr.timeout = 0x12;
 	// attr.retry_cnt = 6;
 	// attr.rnr_retry = 0;
-	attr.sq_psn = 0;
+	attr.sq_psn = psn;
 	// attr.max_rd_atomic = 1;
 	flags = IBV_QP_STATE | IBV_QP_SQ_PSN ;
 	rc = ibv_modify_qp(qp, &attr, flags);
@@ -776,7 +766,7 @@ static int modify_qp_to_rts(struct ibv_qp *qp)
 /******************************************************************************
 * Function: connect_qp
 *
-* Input
+* Inputmodify_qp_to_rts
 * res pointer to resources structure
 *
 * Output
@@ -812,6 +802,7 @@ static int connect_qp(struct resources *res)
 	local_con_data.rkey = htonl(res->mr->rkey);
 	local_con_data.qp_num = htonl(res->qp->qp_num);
 	local_con_data.lid = htons(res->port_attr.lid);
+	local_con_data.psn = htonl(lrand48() & 0xffffffff);
 	memcpy(local_con_data.gid, &my_gid, 16);
 	fprintf(stdout, "\nLocal LID = 0x%x\n", res->port_attr.lid);
 	if (sock_sync_data(res->sock, sizeof(struct cm_con_data_t), (char *)&local_con_data, (char *)&tmp_con_data) < 0)
@@ -824,6 +815,7 @@ static int connect_qp(struct resources *res)
 	remote_con_data.rkey = ntohl(tmp_con_data.rkey);
 	remote_con_data.qp_num = ntohl(tmp_con_data.qp_num);
 	remote_con_data.lid = ntohs(tmp_con_data.lid);
+	remote_con_data.psn = ntohl(tmp_con_data.psn);
 	memcpy(remote_con_data.gid, tmp_con_data.gid, 16);
 	/* save the remote side attributes, we will need it for the post SR */
 	res->remote_props = remote_con_data;
@@ -831,6 +823,7 @@ static int connect_qp(struct resources *res)
 	fprintf(stdout, "Remote rkey = 0x%x\n", remote_con_data.rkey);
 	fprintf(stdout, "Remote QP number = 0x%x\n", remote_con_data.qp_num);
 	fprintf(stdout, "Remote LID = 0x%x\n", remote_con_data.lid);
+	fprintf(stdout, "Remote PSN = 0x%x\n", remote_con_data.psn);
 	if (config.gid_idx >= 0)
 	{
 		uint8_t *p = remote_con_data.gid;
@@ -854,6 +847,17 @@ static int connect_qp(struct resources *res)
 			goto connect_qp_exit;
 		}
 	}
+	struct ibv_ah_attr ah_attr = {
+		.is_global = 1,
+		.dlid = remote_con_data.lid,
+		.sl = 0,
+		.src_path_bits = 0,
+		.port_num = local_con_data.qp_num,
+		.grh.hop_limit = 1,
+		.grh.dgid = config.gid_idx,
+		.grh.sgid_index = config.gid_idx
+
+	};
 	/* modify the QP to RTR */
 	rc = modify_qp_to_rtr(res->qp);
 	if (rc)
@@ -861,18 +865,25 @@ static int connect_qp(struct resources *res)
 		fprintf(stderr, "failed to modify QP state to RTR\n");
 		goto connect_qp_exit;
 	}
-	rc = modify_qp_to_rts(res->qp);
+	rc = modify_qp_to_rts(res->qp, remote_con_data.psn);
 	if (rc)
 	{
 		fprintf(stderr, "failed to modify QP state to RTR\n");
 		goto connect_qp_exit;
 	}
 	fprintf(stdout, "QP state was change to RTS\n");
+
+
 	/* sync to make sure that both sides are in states that they can connect to prevent packet loose */
 	if (sock_sync_data(res->sock, 1, "Q", &temp_char)) /* just send a dummy char back and forth */
 	{
 		fprintf(stderr, "sync error after QPs are were moved to RTS\n");
 		rc = 1;
+	}
+	res->ah = ibv_create_ah(res->pd, &ah_attr);
+	if(!res->ah){
+		fprintf(stderr, "Failed to create AH\n");
+		goto connect_qp_exit;
 	}
 connect_qp_exit:
 	return rc;
@@ -1019,10 +1030,13 @@ int main(int argc, char *argv[])
 			{.name = "port", .has_arg = 1, .val = 'p'},
 			{.name = "ib-dev", .has_arg = 1, .val = 'd'},
 			{.name = "ib-port", .has_arg = 1, .val = 'i'},
+			{.name = "size", .has_arg = 1, .val = 's'},
+			{.name = "rx-depth",.has_arg = 1, .val = 'r'},
+			{.name = "sl", .has_arg = 1, .val = 'l'},
 			{.name = "gid-idx", .has_arg = 1, .val = 'g'},
 			{.name = NULL, .has_arg = 0, .val = '\0'}
         };
-		c = getopt_long(argc, argv, "p:d:i:g:", long_options, NULL);
+		c = getopt_long(argc, argv, "p:d:i:s:r:l:g:", long_options, NULL);
 		if (c == -1)
 			break;
 		switch (c)
@@ -1039,6 +1053,13 @@ int main(int argc, char *argv[])
 			{
 				usage(argv[0]);
 				return 1;
+			}
+			break;
+		case 's':
+			config.size = strtoul(optarg, NULL, 0);
+			if (config.size ==0)
+			{
+				config.size = 1024;
 			}
 			break;
 		case 'g':
