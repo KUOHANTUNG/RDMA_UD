@@ -1023,6 +1023,7 @@ int main(int argc, char *argv[])
 	int rc = 1;
 	char temp_char;
 	/* parse the command line parameters */
+	srand48(getpid() * time(NULL));
 	while (1)
 	{
 		int c;
