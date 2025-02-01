@@ -15,20 +15,41 @@
 #include <arpa/inet.h>
 static int page_size;
 static int validate_buf;
+static int use_odp;
+static int implicit_odp;
+static int prefetch_mr;
+static int use_dm;
+static int	mode;
 enum{
     REVC_WR_ID = 1,
-    SEND_WR_ID = 2,
+    SEND_WR_ID,
+	READ_WR_ID,
+	WRITE_WR_ID
+};
+struct data{
+	struct ibv_mr 	mr;
+	char			txt[256];
+};
+struct message{
+	char head[40];
+	struct data dt;
 };
 
-struct ud_context {
+
+struct context {
 	struct ibv_context	*context; // dev info
 	struct ibv_comp_channel *channel; // complete tunnel
 	struct ibv_pd		*pd;// protect domain
-	struct ibv_mr		*mr;// register memory
+	struct ibv_mr		*msg_mr_send;// register memory
+	struct ibv_mr		*msg_mr_recv;// register memory
+	struct ibv_mr		*mr_read_write;//register memory for read/write
 	struct ibv_cq		*cq;// complete channel 
 	struct ibv_qp		*qp;// queue pair
 	struct ibv_ah		*ah;// address handler
-	char			*buf;
+	struct ibv_dm		*dm;//device memory
+	struct message		*mes_buf_send;
+	struct message		*mes_buf_recv;
+	char 			*buf_read_write;    
 	int			 size;
 	int			 send_flags;
 	int			 rx_depth;
@@ -36,14 +57,14 @@ struct ud_context {
 	struct ibv_port_attr     portinfo; // ibv port info
 };
 
-struct ud_dest {
+struct dest {
 	int lid;//local identifer
 	int qpn;//queue pair number
 	int psn;//packet sequence number
 	union ibv_gid gid;//GID
 };
 
-static int close_ctx(struct ud_context *ctx)
+static int close_ctx(struct context *ctx)
 {
 	if (ibv_destroy_qp(ctx->qp)) {
 		fprintf(stderr, "Couldn't destroy QP\n");
@@ -55,11 +76,18 @@ static int close_ctx(struct ud_context *ctx)
 		return 1;
 	}
 
-	if (ibv_dereg_mr(ctx->mr)) {
-		fprintf(stderr, "Couldn't deregister MR\n");
+	if (ibv_dereg_mr(ctx->msg_mr_send)) {
+		fprintf(stderr, "Couldn't deregister msg_mr_send\n");
 		return 1;
 	}
-
+	if (ibv_dereg_mr(ctx->msg_mr_recv)) {
+		fprintf(stderr, "Couldn't deregister msg_mr_recv\n");
+		return 1;
+	}
+	if (ibv_dereg_mr(ctx->mr_read_write)) {
+		fprintf(stderr, "Couldn't deregister mr_read_write\n");
+		return 1;
+	}
 	if (ibv_destroy_ah(ctx->ah)) {
 		fprintf(stderr, "Couldn't destroy AH\n");
 		return 1;
@@ -82,25 +110,27 @@ static int close_ctx(struct ud_context *ctx)
 		return 1;
 	}
 
-	free(ctx->buf);
+	free(ctx->mes_buf_send);
+	free(ctx->mes_buf_recv);
+	free(ctx->buf_read_write);
 	free(ctx);
 
 	return 0;
 }
 
-static int connect_ctx(struct ud_context *ctx, 
+static int connect_ctx(struct context *ctx, 
     int port, 
     int my_psn,
 	int sl, 
-    struct ud_dest *dest, 
+    struct dest *dest, 
     int sgid_idx
 ){
     struct ibv_ah_attr ah_attr = {
 		.is_global     = 0,
-		.dlid          = dest->lid,
-		.sl            = sl,
+		.dlid          = (uint16_t)dest->lid,
+		.sl            = (uint8_t)sl,
 		.src_path_bits = 0,
-		.port_num      = port
+		.port_num      = (uint8_t)port
 	};
 	struct ibv_qp_attr attr = {
 		.qp_state		= IBV_QPS_RTR
@@ -131,6 +161,64 @@ static int connect_ctx(struct ud_context *ctx,
 	ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
 	if (!ctx->ah) {
 		fprintf(stderr, "Failed to create AH\n");
+		return 1;
+	}
+
+	return 0;
+}
+
+static int rc_connect_ctx(struct context *ctx, int port, int my_psn,
+			  enum ibv_mtu mtu, int sl,
+			  struct dest *dest, int sgid_idx)
+{
+	struct ibv_qp_attr attr = {
+		.qp_state		= IBV_QPS_RTR,
+		.path_mtu		= mtu,
+		.dest_qp_num		= (uint32_t)dest->qpn,
+		.rq_psn			= (uint32_t)dest->psn,
+		.max_dest_rd_atomic	= 1,
+		.min_rnr_timer		= 12,
+		.ah_attr		= {
+			.is_global	= 0,
+			.dlid		= (uint16_t)dest->lid,
+			.sl		= (uint8_t)sl,
+			.src_path_bits	= 0,
+			.port_num	= (uint8_t)port
+		}
+	};
+
+	if (dest->gid.global.interface_id) {
+		attr.ah_attr.is_global = 1;
+		attr.ah_attr.grh.hop_limit = 1;
+		attr.ah_attr.grh.dgid = dest->gid;
+		attr.ah_attr.grh.sgid_index = sgid_idx;
+	}
+	if (ibv_modify_qp(ctx->qp, &attr,
+			  IBV_QP_STATE              |
+			  IBV_QP_AV                 |
+			  IBV_QP_PATH_MTU           |
+			  IBV_QP_DEST_QPN           |
+			  IBV_QP_RQ_PSN             |
+			  IBV_QP_MAX_DEST_RD_ATOMIC |
+			  IBV_QP_MIN_RNR_TIMER)) {
+		fprintf(stderr, "Failed to modify QP to RTR\n");
+		return 1;
+	}
+
+	attr.qp_state	    = IBV_QPS_RTS;
+	attr.timeout	    = 14;
+	attr.retry_cnt	    = 7;
+	attr.rnr_retry	    = 7;
+	attr.sq_psn	    = my_psn;
+	attr.max_rd_atomic  = 1;
+	if (ibv_modify_qp(ctx->qp, &attr,
+			  IBV_QP_STATE              |
+			  IBV_QP_TIMEOUT            |
+			  IBV_QP_RETRY_CNT          |
+			  IBV_QP_RNR_RETRY          |
+			  IBV_QP_SQ_PSN             |
+			  IBV_QP_MAX_QP_RD_ATOMIC)) {
+		fprintf(stderr, "Failed to modify QP to RTS\n");
 		return 1;
 	}
 
@@ -171,10 +259,10 @@ void wire_gid_to_gid(const char *wgid, union ibv_gid *gid)
 /**
  * Exhange dest info
  */
-static struct ud_dest* client_exch_dest(
+static struct dest* client_exch_dest(
     const char *servername, 
     int port,
-	const struct ud_dest *my_dest
+	const struct dest *my_dest
 ){
     struct addrinfo *res, *t;
     struct addrinfo hints = {
@@ -185,7 +273,7 @@ static struct ud_dest* client_exch_dest(
 	char msg[sizeof "0000:000000:000000:00000000000000000000000000000000"];
 	int n;
 	int sockfd = -1;
-	struct ud_dest *rem_dest = NULL;
+	struct dest *rem_dest = NULL;
 	char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
@@ -230,7 +318,7 @@ static struct ud_dest* client_exch_dest(
 		goto out;
 	}
 
-    rem_dest = malloc(sizeof *rem_dest);
+    rem_dest = (struct dest*)malloc(sizeof *rem_dest);
 	if (!rem_dest)
 		goto out;
 
@@ -243,10 +331,10 @@ out:
 	return rem_dest;
 }
 
-static struct ud_dest *server_exch_dest(
-    struct ud_context *ctx,
+static struct dest *server_exch_dest(
+    struct context *ctx,
 	int ib_port, int port, int sl,
-	const struct ud_dest *my_dest,
+	const struct dest *my_dest,
 	int sgid_idx
 ){
     /*main difference is that server needs listening */
@@ -260,7 +348,7 @@ static struct ud_dest *server_exch_dest(
 	char msg[sizeof "0000:000000:000000:00000000000000000000000000000000"];
 	int n;
 	int sockfd = -1, connfd;
-	struct ud_dest *rem_dest = NULL;
+	struct dest *rem_dest = NULL;
 	char gid[33];
 
     if (asprintf(&service, "%d", port) < 0)
@@ -310,7 +398,7 @@ static struct ud_dest *server_exch_dest(
 		goto out;
 	}
 
-	rem_dest = malloc(sizeof *rem_dest);
+	rem_dest = (struct dest*)malloc(sizeof *rem_dest);
 	if (!rem_dest)
 		goto out;
 
@@ -342,16 +430,16 @@ out:
 }
 
 
-static int post_recv(struct ud_context *ctx, int n){
+static int post_recv(struct context *ctx, int n,void *addr, uint32_t length, uint32_t key,uint64_t id){
     /*RECV BUFFER*/
     struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf,
-		.length = ctx->size + 40,
-		.lkey	= ctx->mr->lkey
+		.addr	= (uintptr_t) addr,
+		.length = length,
+		.lkey	= key
 	};
 
     struct ibv_recv_wr wr = {
-		.wr_id	    = REVC_WR_ID,
+		.wr_id	    = id,
 		.sg_list    = &list,
 		.num_sge    = 1,
 	};
@@ -366,19 +454,26 @@ static int post_recv(struct ud_context *ctx, int n){
 	return i;
 }
 
-static int post_send(struct ud_context *ctx, uint32_t qpn)
+static int post_send(struct context *ctx, 
+		uint32_t qpn, 
+		int opcode, 
+		void *addr, 
+		uint32_t length,
+		uint32_t key,
+		uint64_t id
+)
 {
 	struct ibv_sge list = {
-		.addr	= (uintptr_t) ctx->buf + 40,
-		.length = ctx->size,
-		.lkey	= ctx->mr->lkey
+		.addr	= (uintptr_t) addr,
+		.length = length,
+		.lkey	= key
 	};
 	struct ibv_send_wr wr = {
-		.wr_id	    = SEND_WR_ID,
+		.wr_id	    = id,
 		.sg_list    = &list,
 		.num_sge    = 1,
-		.opcode     = IBV_WR_SEND,
-		.send_flags = ctx->send_flags,
+		.opcode     = opcode,
+		.send_flags = (unsigned int)ctx->send_flags,
 		.wr         = {
 			.ud = {
 				 .ah          = ctx->ah,
@@ -388,7 +483,15 @@ static int post_send(struct ud_context *ctx, uint32_t qpn)
 		}
 	};
 	struct ibv_send_wr *bad_wr;
-
+	if(opcode != IBV_WR_SEND){
+		wr.wr.rdma.remote_addr = (uintptr_t)ctx->mes_buf_recv->dt.mr.addr;
+		wr.wr.rdma.rkey = ctx->mes_buf_recv->dt.mr.rkey;
+	}
+	// if(!mode){
+	// 	wr.wr.ud.ah = ctx->ah;
+	// 	wr.wr.ud.remote_qpn  = qpn;
+	// 	wr.wr.ud.remote_qkey = 0x11111111;
+	// }
 	return ibv_post_send(ctx->qp, &wr, &bad_wr);
 }
 
@@ -399,13 +502,16 @@ static int post_send(struct ud_context *ctx, uint32_t qpn)
  * port:
  * use_event:
  */
-static struct ud_context *init_ctx(
-    struct ibv_device *ib_dev,  int size,
-    int rx_depth, int port, int use_event   
+static struct context *init_ctx(
+    struct ibv_device *ib_dev,  
+	int size,
+    int rx_depth, 
+	int port, 
+	int use_event
 ){
-    struct ud_context *ctx;
-
-    ctx = malloc(sizeof *ctx);
+    struct context *ctx;
+	int access_flags = IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_READ|IBV_ACCESS_REMOTE_WRITE;
+    ctx = (struct context*)malloc(sizeof *ctx);
 	if (!ctx)
 		return NULL;
     
@@ -413,19 +519,29 @@ static struct ud_context *init_ctx(
 	ctx->send_flags = IBV_SEND_SIGNALED;
 	ctx->rx_depth   = rx_depth;
     /*align with page_size*/
-	ctx->buf = memalign(page_size, size + 40);
-	if (!ctx->buf) {
+	ctx->mes_buf_recv = (struct message*)memalign(page_size, sizeof(struct message));
+	if (!ctx->mes_buf_recv) {
 		fprintf(stderr, "Couldn't allocate work buf.\n");
 		goto clean_ctx;
 	}
-    
-    memset(ctx->buf, 0, size + 40);
-
+    ctx->buf_read_write = (char*)memalign(page_size, size+40);
+	if (!ctx->buf_read_write) {
+		fprintf(stderr, "Couldn't allocate work buf.\n");
+		goto clean_mes_buf_recv;
+	}
+	ctx->mes_buf_send = (struct message*)memalign(page_size, sizeof(struct message));
+	if (!ctx->mes_buf_send) {
+		fprintf(stderr, "Couldn't allocate work buf.\n");
+		goto clean_buf_read_write;
+	}
+    memset(ctx->mes_buf_send, 0, sizeof(struct message));
+	memset(ctx->mes_buf_recv, 0, sizeof(struct message));
+	memset(ctx->buf_read_write, 0, size+40);
     ctx->context = ibv_open_device(ib_dev);
 	if (!ctx->context) {
 		fprintf(stderr, "Couldn't get context for %s\n",
 			ibv_get_device_name(ib_dev));
-		goto clean_buffer;
+		goto clean_mes_buf_send;
 	}
 
 
@@ -458,18 +574,91 @@ static struct ud_context *init_ctx(
 		fprintf(stderr, "Couldn't allocate PD\n");
 		goto clean_comp_channel;
 	}
+	// if((use_odp || use_dm)&&mode){
+	// 	const uint32_t rc_caps_mask = IBV_ODP_SUPPORT_SEND |
+	// 				      IBV_ODP_SUPPORT_RECV;
+	// 	struct ibv_device_attr_ex attrx;//query expanded function
+	// 	if (ibv_query_device_ex(ctx->context, NULL, &attrx)) {
+	// 		fprintf(stderr, "Couldn't query device for its features\n");
+	// 		goto clean_pd;
+	// 	}
+	// 	if (use_odp) {
+	// 		if (!(attrx.odp_caps.general_caps & IBV_ODP_SUPPORT) ||
+	// 		    (attrx.odp_caps.per_transport_caps.rc_odp_caps & rc_caps_mask) != rc_caps_mask) {
+	// 			fprintf(stderr, "The device isn't ODP capable or does not support RC send and receive with ODP\n");
+	// 			goto clean_pd;
+	// 		}
+	// 		if (implicit_odp &&
+	// 		    !(attrx.odp_caps.general_caps & IBV_ODP_SUPPORT_IMPLICIT)) {
+	// 			fprintf(stderr, "The device doesn't support implicit ODP\n");
+	// 			goto clean_pd;
+	// 		}
+	// 		access_flags |= IBV_ACCESS_ON_DEMAND;
+	// 	}
+	// 	if (use_dm) {
+	// 		struct ibv_alloc_dm_attr dm_attr = {};
 
-    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buf, size + 40, IBV_ACCESS_LOCAL_WRITE);
-	if (!ctx->mr) {
-		fprintf(stderr, "Couldn't register MR\n");
+	// 		if (!attrx.max_dm_size) {
+	// 			fprintf(stderr, "Device doesn't support dm allocation\n");
+	// 			goto clean_pd;
+	// 		}
+
+	// 		if (attrx.max_dm_size < size) {
+	// 			fprintf(stderr, "Device memory is insufficient\n");
+	// 			goto clean_pd;
+	// 		}
+
+	// 		dm_attr.length = size;
+	// 		ctx->dm = ibv_alloc_dm(ctx->context, &dm_attr);
+	// 		if (!ctx->dm) {
+	// 			fprintf(stderr, "Dev mem allocation failed\n");
+	// 			goto clean_pd;
+	// 		}
+
+	// 		access_flags |= IBV_ACCESS_ZERO_BASED;//saving in device memory
+	// 	}
+	// }
+//    if (implicit_odp&&mode) {
+// 		ctx->mr_read_write = ibv_reg_mr(ctx->pd, NULL, SIZE_MAX, access_flags);
+// 	} else {
+		ctx->mr_read_write = ibv_reg_mr(ctx->pd, ctx->buf_read_write, size+40, access_flags);
+	// }
+
+	// if (prefetch_mr&&mode) {
+	// 	struct ibv_sge sg_list;
+	// 	int ret;
+
+	// 	sg_list.lkey = ctx->mr->lkey;
+	// 	sg_list.addr = (uintptr_t)ctx->buf_read_write;
+	// 	sg_list.length = size;
+	// 	/*memory area advice*/
+	// 	/*sychronize refresh */
+	// 	ret = ibv_advise_mr(ctx->pd, IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+	// 			    IB_UVERBS_ADVISE_MR_FLAG_FLUSH,
+	// 			    &sg_list, 1);
+
+	// 	if (ret)
+	// 		fprintf(stderr, "Couldn't prefetch MR(%d). Continue anyway\n", ret);
+	// }
+	if (!ctx->mr_read_write) {
+		fprintf(stderr, "Couldn't register mr_read_write\n");
 		goto clean_pd;
 	}
-
+	ctx->msg_mr_send = ibv_reg_mr(ctx->pd, ctx->mes_buf_send, sizeof(struct message), IBV_ACCESS_LOCAL_WRITE);
+	if (!ctx->msg_mr_send) {
+		fprintf(stderr, "Couldn't register msg_mr_send\n");
+		goto clean_mr_read_write;
+	}
+	ctx->msg_mr_recv = ibv_reg_mr(ctx->pd, ctx->mes_buf_recv, sizeof(struct message), IBV_ACCESS_LOCAL_WRITE);
+	if (!ctx->msg_mr_recv) {
+		fprintf(stderr, "Couldn't register msg_mr_recv\n");
+		goto clean_msg_mr_send;
+	}
     ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
     ctx->channel, 0);
 	if (!ctx->cq) {
 		fprintf(stderr, "Couldn't create CQ\n");
-		goto clean_mr;
+		goto clean_msg_mr_recv;
 	}
     /**init qp */
     {
@@ -479,11 +668,11 @@ static struct ud_context *init_ctx(
 			.recv_cq = ctx->cq,
 			.cap     = {
 				.max_send_wr  = 1,
-				.max_recv_wr  = rx_depth,
+				.max_recv_wr  = (uint32_t)rx_depth,
 				.max_send_sge = 1,
 				.max_recv_sge = 1
 			},
-			.qp_type = IBV_QPT_UD,
+			.qp_type = mode? IBV_QPT_RC:IBV_QPT_UD,
 		};
 
         ctx->qp = ibv_create_qp(ctx->pd, &init_attr);
@@ -500,14 +689,14 @@ static struct ud_context *init_ctx(
     }
 
     {
-        struct ibv_qp_attr attr = {
-			.qp_state        = IBV_QPS_INIT,
-			.pkey_index      = 0,//default patition
-			.port_num        = port,
-			.qkey            = 0x11111111
-		};
-
-		if (ibv_modify_qp(ctx->qp, &attr,
+        // if(!mode){
+			struct ibv_qp_attr attr_ud = {
+				.qp_state        = IBV_QPS_INIT,
+				.pkey_index      = 0,//default patition
+				.port_num        = (uint8_t) port,
+				.qkey            = 0x11111111
+			};
+			if (ibv_modify_qp(ctx->qp, &attr_ud,
 				  IBV_QP_STATE              |
 				  IBV_QP_PKEY_INDEX         |
 				  IBV_QP_PORT               |
@@ -515,6 +704,22 @@ static struct ud_context *init_ctx(
 			fprintf(stderr, "Failed to modify QP to INIT\n");
 			goto clean_qp;
 		}
+		// }else{
+		// 	struct ibv_qp_attr attr_rc = {
+		// 	.qp_state        = IBV_QPS_INIT,
+		// 	.pkey_index      = 0,
+		// 	.port_num        =(uint8_t) port,
+		// 	.qp_access_flags = 0
+		// 	};
+		// 	if (ibv_modify_qp(ctx->qp, &attr_rc,
+		// 		  IBV_QP_STATE              |
+		// 		  IBV_QP_PKEY_INDEX         |
+		// 		  IBV_QP_PORT               |
+		// 		  IBV_QP_ACCESS_FLAGS)) {
+		// 	fprintf(stderr, "Failed to modify QP to INIT\n");
+		// 	goto clean_qp;
+		// 	}
+		// }
     }
         return ctx;
     clean_qp:
@@ -522,23 +727,26 @@ static struct ud_context *init_ctx(
 
     clean_cq:
 	ibv_destroy_cq(ctx->cq);
-
-    clean_mr:
-	ibv_dereg_mr(ctx->mr);
-
+	clean_msg_mr_recv:
+	ibv_dereg_mr(ctx->msg_mr_recv);
+    clean_msg_mr_send:
+	ibv_dereg_mr(ctx->msg_mr_send);
+	clean_mr_read_write:
+	ibv_dereg_mr(ctx->mr_read_write);
     clean_pd:
 	ibv_dealloc_pd(ctx->pd);
-
     clean_comp_channel:
 	if (ctx->channel)
 		ibv_destroy_comp_channel(ctx->channel);
-
     clean_device:
 	ibv_close_device(ctx->context);
 
-    clean_buffer:
-	free(ctx->buf);
-
+    clean_mes_buf_send:
+	free(ctx->mes_buf_send);
+	clean_buf_read_write:
+	free(ctx->buf_read_write);
+	clean_mes_buf_recv:
+	free(ctx->mes_buf_recv);
     clean_ctx:
 	free(ctx);
 
@@ -559,19 +767,24 @@ static void usage(const char *argv0)
 	printf("  -s, --size=<size>      size of message to exchange (default 2048)\n");
 	printf("  -r, --rx-depth=<dep>   number of receives to post at a time (default 500)\n");
 	printf("  -n, --iters=<iters>    number of exchanges (default 1000)\n");
-        printf("  -l, --sl=<SL>          send messages with service level <SL> (default 0)\n");
+    printf("  -l, --sl=<SL>          send messages with service level <SL> (default 0)\n");
 	printf("  -e, --events           sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
 	printf("  -c, --chk              validate received buffer\n");
+	printf("  -m, --rc				 reliable connection\n");
+	printf("  -j, --dm	            use device memory\n");
+	printf("  -o, --odp		    use on demand paging\n");
+	printf("  -P, --prefetch	    prefetch an ODP MR\n");
+	printf("  -O, --iodp		    use implicit on demand paging\n");
 }
 
 
 int main(int argc, char* argv[]){
     struct ibv_device      **dev_list;
 	struct ibv_device	*ib_dev;
-	struct ud_context *ctx;
-	struct ud_dest     my_dest;
-	struct ud_dest    *rem_dest;
+	struct context *ctx;
+	struct dest     my_dest;
+	struct dest    *rem_dest;
 	struct timeval           start, end;
 	char                    *ib_devname = NULL;
 	char                    *servername = NULL;
@@ -604,9 +817,14 @@ int main(int argc, char* argv[]){
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
 			{ .name = "chk",      .has_arg = 0, .val = 'c' },
+			{ .name = "rc",	  .has_arg = 0, .val = 'm' },
+			{ .name = "dm",       .has_arg = 0, .val = 'j' },
+			{ .name = "odp",      .has_arg = 0, .val = 'o' },
+			{ .name = "iodp",     .has_arg = 0, .val = 'O' },
+			{ .name = "prefetch", .has_arg = 0, .val = 'P' },
 			{}
 		};
-        c = getopt_long(argc, argv, "p:d:i:s:r:n:l:eg:c", long_options,
+        c = getopt_long(argc, argv, "p:d:i:s:r:n:l:eg:c:m", long_options,
 				NULL);
         
         if (c == -1)
@@ -660,7 +878,21 @@ int main(int argc, char* argv[]){
 		case 'c':
 			validate_buf = 1;
 			break;
-
+		case 'm':
+			mode = 1;
+		case 'o':
+			use_odp = 1;
+			break;
+				case 'P':
+			prefetch_mr = 1;
+			break;
+		case 'O':
+			use_odp = 1;
+			implicit_odp = 1;
+			break;
+		case 'j':
+			use_dm = 1;
+			break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -671,6 +903,17 @@ int main(int argc, char* argv[]){
 		servername = strdupa(argv[optind]);
 	else if (optind < argc) {
 		usage(argv[0]);
+		return 1;
+	}
+
+
+	if ((use_odp && use_dm)&&mode) {
+		fprintf(stderr, "DM memory region can't be on demand\n");
+		return 1;
+	}
+
+	if ((!use_odp && prefetch_mr)&&mode) {
+		fprintf(stderr, "prefetch is valid only with on-demand memory region\n");
 		return 1;
 	}
     page_size = sysconf(_SC_PAGESIZE);//get system page size
@@ -705,7 +948,11 @@ int main(int argc, char* argv[]){
     ctx = init_ctx(ib_dev, size, rx_depth, ib_port, use_event);
     if(!ctx)
         return 1;
-    routs = post_recv(ctx,ctx->rx_depth);
+    routs = post_recv(ctx,ctx->rx_depth,ctx->mes_buf_recv,
+			sizeof(struct message),
+			ctx->msg_mr_recv->lkey,
+			REVC_WR_ID
+			);
     if(routs < ctx->rx_depth){
         fprintf(stderr, "Couldn't post receive (%d)\n", routs);
         return 1;
@@ -723,7 +970,7 @@ int main(int argc, char* argv[]){
 		return 1;
 	}
 
-    my_dest.lid = ctx->portinfo.lid;
+    my_dest.lid = ctx->portinfo.lid;//only ud mode use
 	my_dest.qpn = ctx->qp->qp_num;
 	my_dest.psn = lrand48() & 0xffffff;
 
@@ -765,14 +1012,28 @@ int main(int argc, char* argv[]){
 	}
     if (servername) {
         pid_t pid = getpid();
-        sprintf(ctx->buf + 40,"HELLO,I am client %d, current time: %ld\n", pid, start.tv_sec);
-		if (post_send(ctx, rem_dest->qpn)) {
+
+        sprintf(ctx->mes_buf_send->dt.txt,
+		"HELLO,I am client %d, my_local_key: %d and mem_address: %p\n", 
+		pid, 
+		ctx->mr_read_write->rkey,
+		ctx->mr_read_write->addr
+		);
+		memcpy(&ctx->mes_buf_send->dt.mr,ctx->mr_read_write,sizeof(struct ibv_mr));
+		if (post_send(ctx, rem_dest->qpn,IBV_WR_SEND,
+			&(ctx->mes_buf_send->dt),sizeof(struct data),
+			ctx->msg_mr_send->lkey,
+			SEND_WR_ID
+			)) {
 			fprintf(stderr, "Couldn't post send\n");
 			return 1;
 		}
         scnt++;//client has sent
 		ctx->pending |= SEND_WR_ID;
 	}
+	// if(!servername){
+	// 	sprintf(ctx->buf_read_write+40,"server start_time:%lx",start.tv_sec);
+	// }
 	for(int j =0; j<2;j++){
 		/*event driver*/
     if(use_event){
@@ -817,18 +1078,50 @@ int main(int argc, char* argv[]){
                 case SEND_WR_ID :
                     printf("SUCCESSFUL SEND DATA\n");
                     break;
-                case REVC_WR_ID :
-                    printf("RECEIVED DATA FROM REMOTE: %s\n", ctx->buf + 40);
+                case REVC_WR_ID :						
+                    printf("RECEIVED DATA FROM REMOTE: %s\n", ctx->mes_buf_recv->dt.txt);
                     if(!scnt){
                         pid_t pid = getpid();
-                        sprintf(ctx->buf + 40,"HELLO,I am server %d, current time: %ld\n", pid, start.tv_sec);
-		                if (post_send(ctx, rem_dest->qpn)) {
-			                fprintf(stderr, "Couldn't post send\n");
-			                return 1;
-		                }
+						sprintf(ctx->mes_buf_send->dt.txt,
+								"HELLO,I am server %d, my_local_key: %d and mem_address: %p\n", 
+								pid, 
+								ctx->mr_read_write->rkey,
+								ctx->mr_read_write->addr
+								);
+						memcpy(&ctx->mes_buf_send->dt.mr,ctx->mr_read_write,sizeof(struct ibv_mr));
+						if (post_send(ctx, rem_dest->qpn,IBV_WR_SEND,
+							&(ctx->mes_buf_send->dt),sizeof(struct data),
+							ctx->msg_mr_send->lkey,
+							SEND_WR_ID
+							)) {
+							fprintf(stderr, "Couldn't post send\n");
+							return 1;
+						}
                         scnt++;//client has sent  
                     }
+					// if(servername){
+					// 	if(post_send(ctx,rem_dest->qpn,IBV_WR_RDMA_READ,
+					// 	ctx->buf_read_write+40,size,
+					// 	ctx->mr_read_write->lkey,READ_WR_ID)){
+					// 		fprintf(stderr, "Couldn't post WRITE_WR\n");
+					// 		return 1;
+					// 	}
+					// 	printf("I am here\n");
+					// }
                     break;
+				// case READ_WR_ID:
+				// 	printf("....the server buffer content:%s\n", ctx->buf_read_write+40);
+				// 	sprintf(ctx->buf_read_write+40,"hello,server! i have change your data time: 0000\n");
+				// 	if(post_send(ctx,rem_dest->qpn,IBV_WR_RDMA_WRITE,
+				// 		ctx->buf_read_write+40,size,
+				// 		ctx->mr_read_write->lkey,WRITE_WR_ID)){
+				// 			fprintf(stderr, "Couldn't post WRITE_WR\n");
+				// 			return 1;
+				// 		}
+				// 	break;
+				// case WRITE_WR_ID:
+				// 	printf("SUCCESSFUL CHANGE DATA\n");
+				// 	break;
                 default:
                     fprintf(stderr, "Completion for unknown wr_id %d\n",
 					(int) wc[i].wr_id);
@@ -839,9 +1132,11 @@ int main(int argc, char* argv[]){
             
     }
 
-	}    
-    
-
+	}
+	// if(!servername){
+	// 	sleep(2);//edlay two minutes to wait client
+	// 	printf("....the server buffer content:%s\n", ctx->buf_read_write+40);
+	// }  
     ibv_ack_cq_events(ctx->cq, num_cq_events);
     if (gettimeofday(&end, NULL)) {
 		perror("gettimeofday");
